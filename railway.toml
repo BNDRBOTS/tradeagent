@@ -1,5 +1,12 @@
 [build]
 builder = "dockerfile"
+dockerfilePath = "Dockerfile"
 
 [deploy]
-restartPolicyType = "always"
+startCommand = "python main.py"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
+
+[[services]]
+healthcheckPath = "/api/health"
+healthcheckTimeout = 30

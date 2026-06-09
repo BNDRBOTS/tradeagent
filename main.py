@@ -1,12 +1,13 @@
 """
-Entry point. Startup sequence:
-  1. Configure logging
-  2. Run backtest gate — halt and exit(2) if any gate fails
-  3. Fetch live USDT balance
-  4. Start WebSocket feeds
-  5. Run instrument engines until shutdown signal
-
-Daily reset: position sizer counters cleared at UTC midnight.
+Entry point. Full startup sequence:
+1. Logging
+2. Env validation
+3. DB init
+4. Backtest gate (sys.exit(2) on failure)
+5. Cancel-on-disconnect via REST
+6. Balance sync
+7. asyncio.gather: uvicorn web server + WS bot + daily reset + balance sync + kill monitor
+Kill monitor watches store.kill_event; when set, cancels bot tasks while keeping web server live.
 """
 import asyncio
 import logging
@@ -15,134 +16,156 @@ import sys
 import time
 from typing import Dict
 
+import uvicorn
+
 from broker.rest_client import CryptoComRestClient
 from broker.ws_client import CryptoComWSClient
 from backtest.engine import run_startup_backtest
 from bot_engine import InstrumentEngine
 from config import settings
+from dashboard.api import app as dashboard_app
+from dashboard.persistence import init_db
+from dashboard.state_store import store
 from risk.position_sizer import PositionSizer
 
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
+    format="%(asctime)s | %(levelname)-8s | %(name)-25s | %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger("main")
 
-def _configure_logging() -> None:
-    level = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S",
-    )
 
-
-def _run_backtest_gate(rest: CryptoComRestClient) -> None:
-    btc_result, eth_result = run_startup_backtest(rest)
-    failed = [r for r in (btc_result, eth_result) if not r.gate_pass]
-    if failed:
-        for r in failed:
-            logging.critical(
-                "STARTUP GATE FAILED — %s: %s", r.instrument, r.gate_failures
-            )
-        logging.critical("Bot halted: backtest gates not cleared. Fix strategy or lower MIN_BACKTEST_TRADES.")
-        sys.exit(2)
-    logging.info("All backtest gates passed — proceeding to live trading.")
+def _validate_env() -> None:
+    if not settings.DRY_RUN:
+        missing = [k for k, v in [("CRYPTOCOM_API_KEY", settings.API_KEY),
+                                   ("CRYPTOCOM_API_SECRET", settings.API_SECRET)] if not v]
+        if missing:
+            logger.critical("Missing env vars: %s", missing)
+            sys.exit(1)
+    else:
+        logger.warning("DRY_RUN=True — orders are simulated, not submitted")
 
 
 async def _daily_reset_loop(sizer: PositionSizer) -> None:
-    """Resets daily PnL counters at UTC midnight."""
     while True:
-        now  = time.gmtime()
-        secs_until_midnight = (23 - now.tm_hour) * 3600 + (59 - now.tm_min) * 60 + (60 - now.tm_sec)
-        await asyncio.sleep(secs_until_midnight + 1)
+        now = time.gmtime()
+        secs = (23 - now.tm_hour) * 3600 + (59 - now.tm_min) * 60 + (60 - now.tm_sec)
+        await asyncio.sleep(max(secs, 1))
         sizer.reset_daily()
+        snap = sizer.get_snapshot()
+        store.update_risk(**snap)
+        logger.info("Daily risk counters reset at UTC midnight")
+
+
+async def _balance_sync_loop(rest: CryptoComRestClient, sizer: PositionSizer) -> None:
+    while True:
+        try:
+            balance = rest.get_usdt_balance()
+            if balance > 0:
+                sizer.update_balance(balance)
+                snap = sizer.get_snapshot()
+                store.update_risk(**snap)
+                logger.debug("Balance sync: %.4f USDT", balance)
+        except Exception as exc:
+            logger.warning("Balance sync error: %s", exc)
+        await asyncio.sleep(60)
 
 
 async def main() -> None:
-    _configure_logging()
-    logger = logging.getLogger("main")
-    logger.info("Bot starting. DRY_RUN=%s", settings.DRY_RUN)
+    logger.info("=" * 70)
+    logger.info("Crypto Trading Bot — startup")
+    logger.info("DRY_RUN=%-5s  LOG_LEVEL=%s", settings.DRY_RUN, settings.LOG_LEVEL)
+    logger.info("BTC: %-20s  ETH: %s", settings.BTC_INSTRUMENT, settings.ETH_INSTRUMENT)
+    logger.info("=" * 70)
 
-    rest  = CryptoComRestClient()
+    _validate_env()
+    store.set_startup(dry_run=settings.DRY_RUN)
 
-    # ── Startup gate ─────────────────────────────────────────────────────────
-    _run_backtest_gate(rest)
+    # Init SQLite
+    await init_db()
 
-    # ── Fetch live balance ────────────────────────────────────────────────────
+    # Backtest gate
+    rest = CryptoComRestClient()
+    btc_result, eth_result = run_startup_backtest(rest)
+    store.set_backtest_results([btc_result, eth_result])
+
+    failures = [f"[{r.instrument}] {f}"
+                for r in [btc_result, eth_result]
+                for f in r.gate_failures]
+    if failures:
+        logger.critical("STARTUP GATE FAILED — bot will not start")
+        for f in failures:
+            logger.critical("  FAIL: %s", f)
+        sys.exit(2)
+
+    logger.info("All backtest gates passed")
+
     if not settings.DRY_RUN:
         try:
-            balance = rest.get_usdt_balance()
-            if balance <= 0:
-                logger.critical("Live balance fetch returned 0 — check API credentials and account")
-                sys.exit(1)
-            logger.info("Live USDT balance: %.4f", balance)
+            rest.set_cancel_on_disconnect("CONNECTION")
+            logger.info("Cancel-on-disconnect set via REST")
         except Exception as exc:
-            logger.critical("Balance fetch failed: %s — halting", exc)
-            sys.exit(1)
-    else:
-        balance = settings.ACCOUNT_CAPITAL
-        logger.info("[DRY_RUN] Using simulated balance: %.2f", balance)
+            logger.warning("REST CoD failed (non-fatal): %s", exc)
 
     sizer = PositionSizer()
-    sizer.update_balance(balance)
-
-    # ── Create instrument engines ─────────────────────────────────────────────
-    btc_engine = InstrumentEngine(
-        instrument=settings.BTC_INSTRUMENT,
-        strategy_class=settings.BTC_STRATEGY_CLASS,
-        rest_client=rest,
-        sizer=sizer,
-    )
-    eth_engine = InstrumentEngine(
-        instrument=settings.ETH_INSTRUMENT,
-        strategy_class=settings.ETH_STRATEGY_CLASS,
-        rest_client=rest,
-        sizer=sizer,
-    )
-    engines: Dict[str, InstrumentEngine] = {
-        settings.BTC_INSTRUMENT: btc_engine,
-        settings.ETH_INSTRUMENT: eth_engine,
-    }
-
-    # ── WebSocket callbacks ───────────────────────────────────────────────────
-    async def on_candle(instrument: str, candle: dict) -> None:
-        eng = engines.get(instrument)
-        if eng: await eng.on_candlestick(instrument, candle)
-
-    async def on_book(instrument: str, book: dict) -> None:
-        eng = engines.get(instrument)
-        if eng: await eng.on_book(instrument, book)
-
-    async def on_order(order: dict) -> None:
-        instrument = order.get("instrument_name", "")
-        eng = engines.get(instrument)
-        if eng: await eng.on_order_update(order)
-
-    # ── Configure and start WebSocket client ──────────────────────────────────
-    ws = CryptoComWSClient(candle_cb=on_candle, book_cb=on_book, order_cb=on_order)
-    ws.subscribe_candlestick(settings.BTC_INSTRUMENT, settings.BTC_CANDLE_TF)
-    ws.subscribe_candlestick(settings.ETH_INSTRUMENT, settings.ETH_CANDLE_TF)
-    ws.subscribe_book(settings.BTC_INSTRUMENT)
-    ws.subscribe_book(settings.ETH_INSTRUMENT)
-
-    loop = asyncio.get_event_loop()
-
-    async def run() -> None:
-        await ws.start()
-        reset_task = loop.create_task(_daily_reset_loop(sizer))
-        logger.info("Bot live. Monitoring %s and %s.",
-                    settings.BTC_INSTRUMENT, settings.ETH_INSTRUMENT)
-        try:
-            # Run until cancelled (Railway SIGTERM / KeyboardInterrupt)
-            while True:
-                await asyncio.sleep(60)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            reset_task.cancel()
-            await ws.stop()
-            logger.info("Bot shutdown complete.")
-
     try:
-        await run()
-    except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt — shutting down")
+        balance = rest.get_usdt_balance()
+        if balance > 0:
+            sizer.update_balance(balance)
+            logger.info("Initial USDT balance: %.4f", balance)
+    except Exception as exc:
+        logger.warning("Initial balance fetch failed: %s", exc)
+    store.update_risk(**sizer.get_snapshot())
+
+    btc_engine = InstrumentEngine(settings.BTC_INSTRUMENT, settings.BTC_STRATEGY_CLASS, rest, sizer)
+    eth_engine = InstrumentEngine(settings.ETH_INSTRUMENT, settings.ETH_STRATEGY_CLASS, rest, sizer)
+
+    async def on_candlestick(instrument: str, candle: Dict) -> None:
+        await btc_engine.on_candlestick(instrument, candle)
+        await eth_engine.on_candlestick(instrument, candle)
+
+    async def on_d1_candlestick(instrument: str, candle: Dict) -> None:
+        if instrument == settings.BTC_INSTRUMENT:
+            btc_engine.push_d1_candle(candle)
+
+    async def on_book(instrument: str, book: Dict) -> None:
+        await btc_engine.on_book(instrument, book)
+        await eth_engine.on_book(instrument, book)
+
+    async def on_order_update(order: Dict) -> None:
+        await btc_engine.on_order_update(order)
+        await eth_engine.on_order_update(order)
+
+    ws = CryptoComWSClient(
+        on_candlestick=on_candlestick,
+        on_d1_candlestick=on_d1_candlestick,
+        on_book=on_book,
+        on_order_update=on_order_update,
+    )
+
+    port = int(os.environ.get("PORT", 8080))
+    uvi_config = uvicorn.Config(dashboard_app, host="0.0.0.0", port=port,
+                                log_level="warning", loop="none")
+    uvi_server = uvicorn.Server(uvi_config)
+    logger.info("Dashboard starting on port %d", port)
+
+    # Bot tasks (killed by kill switch)
+    bot_tasks = [
+        asyncio.create_task(ws.start(),              name="ws"),
+        asyncio.create_task(_daily_reset_loop(sizer), name="daily_reset"),
+        asyncio.create_task(_balance_sync_loop(rest, sizer), name="balance_sync"),
+    ]
+    web_task = asyncio.create_task(uvi_server.serve(), name="web")
+
+    async def _kill_monitor() -> None:
+        await store.kill_event.wait()
+        logger.warning("KILL SWITCH activated — halting bot tasks (web server stays live)")
+        for t in bot_tasks:
+            t.cancel()
+
+    await asyncio.gather(web_task, _kill_monitor(), *bot_tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":
